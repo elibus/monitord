@@ -17,7 +17,7 @@ use zbus::zvariant::ObjectPath;
 
 use crate::config::Config;
 use crate::dbus::zbus_systemd::ManagerProxy;
-use crate::dbus::zbus_unit::UnitProxy;
+use crate::dbus_props::{extract_property, get_all_properties};
 use crate::MachineStats;
 
 /// Boot blame statistics: maps unit name to activation time in seconds
@@ -140,18 +140,18 @@ async fn write_cached_boot_blame_to_dir(
 
 /// Calculate the activation time for a unit
 /// Returns the time in seconds from InactiveExitTimestamp to ActiveEnterTimestamp
+///
+/// Both timestamps come from a single `Properties.GetAll` call instead of two
+/// individual `Properties.Get` round trips.
 async fn get_unit_activation_time(
     connection: &zbus::Connection,
     unit_path: &ObjectPath<'_>,
 ) -> Result<f64> {
-    let unit_proxy = UnitProxy::builder(connection)
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .path(unit_path)?
-        .build()
-        .await?;
+    let unit_props =
+        get_all_properties(connection, unit_path, "org.freedesktop.systemd1.Unit").await?;
 
-    let inactive_exit = unit_proxy.inactive_exit_timestamp().await?;
-    let active_enter = unit_proxy.active_enter_timestamp().await?;
+    let inactive_exit: u64 = extract_property(&unit_props, "InactiveExitTimestamp")?;
+    let active_enter: u64 = extract_property(&unit_props, "ActiveEnterTimestamp")?;
 
     // If either timestamp is 0, the unit hasn't been activated or the timing is invalid
     if inactive_exit == 0 || active_enter == 0 {
