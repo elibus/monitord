@@ -54,6 +54,7 @@ Single-crate project (both library and binary). The binary (`main.rs`) parses CL
 - `timer.rs` — Timer unit statistics
 - `machines.rs` — Container stats; recursively opens D-Bus connections to each container and collects the same stat types
 - `dbus_stats.rs` — D-Bus daemon statistics (supports both dbus-broker and dbus-daemon)
+- `dbus_props_cache.rs` — Opt-in, daemon-mode-only cached D-Bus property path (`[dbus_property_cache]`); keeps long-lived proxies across collection cycles instead of the default stateless fetch-per-cycle behavior
 - `dbus/` — Auto-generated zbus proxy interfaces (via `zbus-xmlgen`); do not hand-edit
 
 ### Run Modes

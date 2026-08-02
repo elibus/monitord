@@ -562,6 +562,18 @@ fn flatten_units_collection_timings(
         format!("{base_metric_name}.service_dbus_fetches"),
         timings.service_dbus_fetches.into(),
     );
+    flat_stats.insert(
+        format!("{base_metric_name}.state_cache_hits"),
+        timings.state_cache_hits.into(),
+    );
+    flat_stats.insert(
+        format!("{base_metric_name}.service_cache_hits"),
+        timings.service_cache_hits.into(),
+    );
+    flat_stats.insert(
+        format!("{base_metric_name}.timer_cache_hits"),
+        timings.timer_cache_hits.into(),
+    );
     flat_stats
 }
 
@@ -635,8 +647,11 @@ mod tests {
   "boot.blame.sys-module-fuse.device": 16.21,
   "collection_timings.list_units_ms": 5.0,
   "collection_timings.per_unit_loop_ms": 37.0,
+  "collection_timings.service_cache_hits": 0,
   "collection_timings.service_dbus_fetches": 1,
+  "collection_timings.state_cache_hits": 0,
   "collection_timings.state_dbus_fetches": 0,
+  "collection_timings.timer_cache_hits": 0,
   "collection_timings.timer_dbus_fetches": 4,
   "collector_timings.boot_blame.elapsed_ms": 12.5,
   "collector_timings.boot_blame.start_offset_ms": 0.25,
@@ -646,8 +661,11 @@ mod tests {
   "collector_timings.units.success": 1,
   "machines.foo.collection_timings.list_units_ms": 0.0,
   "machines.foo.collection_timings.per_unit_loop_ms": 0.0,
+  "machines.foo.collection_timings.service_cache_hits": 0,
   "machines.foo.collection_timings.service_dbus_fetches": 0,
+  "machines.foo.collection_timings.state_cache_hits": 0,
   "machines.foo.collection_timings.state_dbus_fetches": 0,
+  "machines.foo.collection_timings.timer_cache_hits": 0,
   "machines.foo.collection_timings.timer_dbus_fetches": 0,
   "machines.foo.networkd.managed_interfaces": 0,
   "machines.foo.system-state": 0,
@@ -817,6 +835,9 @@ mod tests {
             timer_dbus_fetches: 4,
             state_dbus_fetches: 0,
             service_dbus_fetches: 1,
+            state_cache_hits: 0,
+            service_cache_hits: 0,
+            timer_cache_hits: 0,
         };
         let service_unit_name = String::from("unittest.service");
         stats.units.service_stats.insert(
@@ -885,7 +906,7 @@ mod tests {
     #[test]
     fn test_flatten_map() {
         let json_flat_map = flatten_stats(&return_monitord_stats(), "");
-        assert_eq!(127, json_flat_map.len());
+        assert_eq!(133, json_flat_map.len());
     }
 
     #[test]

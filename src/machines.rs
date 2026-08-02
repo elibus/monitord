@@ -265,11 +265,14 @@ pub async fn update_machines_stats(
                                 err
                             );
                             let container_root = format!("/proc/{}/root", leader_pid);
+                            // Cached property path is host-only in this first pass -
+                            // see dbus_props_cache.rs.
                             crate::units::update_unit_stats(
                                 config_clone,
                                 sdc_clone,
                                 stats_clone,
                                 container_root,
+                                None,
                             )
                             .await
                         }
@@ -277,11 +280,14 @@ pub async fn update_machines_stats(
                 });
             } else {
                 let container_root = format!("/proc/{}/root", leader_pid);
+                // Cached property path is host-only in this first pass - see
+                // dbus_props_cache.rs.
                 join_set.spawn(crate::units::update_unit_stats(
                     Arc::clone(&config),
                     sdc.clone(),
                     locked_machine_stats.clone(),
                     container_root,
+                    None,
                 ));
             }
         }

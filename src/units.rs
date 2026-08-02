@@ -4,12 +4,14 @@
 //! queued jobs. We also house service specific statistics and system unit states.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use futures_util::StreamExt;
 use struct_field_names_as_array::FieldNamesAsArray;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -29,6 +31,7 @@ pub enum MonitordUnitsError {
     SystemTimeError(#[from] std::time::SystemTimeError),
 }
 
+use crate::dbus_props_cache::{CacheOutcome, UnitPropertyCache};
 use crate::timer::TimerStats;
 use crate::MachineStats;
 
@@ -58,6 +61,16 @@ pub struct UnitsCollectionTimings {
     pub state_dbus_fetches: u64,
     /// Number of per-service D-Bus property fetches this run.
     pub service_dbus_fetches: u64,
+    /// Number of unit-state property reads (time-in-state + oneshot-service check)
+    /// served from an already-warm cached proxy this run. Always 0 when the cached
+    /// property path is not in use.
+    pub state_cache_hits: u64,
+    /// Number of per-service property reads served from an already-warm cached
+    /// proxy this run. Always 0 when the cached property path is not in use.
+    pub service_cache_hits: u64,
+    /// Number of per-timer property reads served from an already-warm cached
+    /// proxy this run. Always 0 when the cached property path is not in use.
+    pub timer_cache_hits: u64,
 }
 
 /// Unit file counts for a scope (root or user), broken down by unit type.
@@ -261,27 +274,58 @@ pub const SERVICE_FIELD_NAMES: &[&str] = &ServiceStats::FIELD_NAMES_AS_ARRAY;
 pub const UNIT_FIELD_NAMES: &[&str] = &SystemdUnitStats::FIELD_NAMES_AS_ARRAY;
 pub const UNIT_STATES_FIELD_NAMES: &[&str] = &UnitStates::FIELD_NAMES_AS_ARRAY;
 
-/// Pull out selected systemd service statistics
+/// Pull out selected systemd service statistics.
+///
+/// When `cache` is `Some` (daemon-mode-only cached path, see `dbus_props_cache.rs`),
+/// reads come from long-lived, zbus-cache-backed proxies instead of a fresh proxy +
+/// live property fetch every call - zero new D-Bus calls once both proxies are warm.
+/// `service_cache_hits` is bumped once per proxy that was already warm (0, 1, or 2
+/// per call).
 async fn parse_service(
     connection: &zbus::Connection,
     name: &str,
     object_path: &OwnedObjectPath,
+    cache: Option<&RwLock<UnitPropertyCache>>,
+    service_cache_hits: &mut u64,
 ) -> Result<ServiceStats, MonitordUnitsError> {
     debug!("Parsing service {} stats", name);
 
-    let sp = crate::dbus::zbus_service::ServiceProxy::builder(connection)
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .path(object_path.clone())?
-        .build()
-        .await?;
-    let up = crate::dbus::zbus_unit::UnitProxy::builder(connection)
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .path(object_path.clone())?
-        .build()
-        .await?;
+    let (sp, up) = if let Some(cache) = cache {
+        let (unit_entry, unit_outcome) =
+            crate::dbus_props_cache::get_or_create_unit_proxy(cache, connection, name, object_path)
+                .await?;
+        let (service_proxy, service_outcome) =
+            crate::dbus_props_cache::get_or_create_service_proxy(
+                cache,
+                connection,
+                name,
+                object_path,
+            )
+            .await?;
+        for outcome in [unit_outcome, service_outcome] {
+            if outcome == CacheOutcome::Hit {
+                *service_cache_hits += 1;
+            }
+        }
+        (service_proxy, unit_entry.unit)
+    } else {
+        let sp = crate::dbus::zbus_service::ServiceProxy::builder(connection)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .path(object_path.clone())?
+            .build()
+            .await?;
+        let up = crate::dbus::zbus_unit::UnitProxy::builder(connection)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .path(object_path.clone())?
+            .build()
+            .await?;
+        (sp, up)
+    };
 
     // Use tokio::join! without tokio::spawn to avoid per-task allocation overhead.
     // These all share the same D-Bus connection so spawn adds no parallelism benefit.
+    // In the cached case, each getter transparently serves from the proxy's warm
+    // cache instead of issuing a live Properties.Get.
     let (
         active_enter_timestamp,
         active_exit_timestamp,
@@ -338,56 +382,87 @@ async fn parse_service(
     })
 }
 
+/// Returns the computed time-in-state, plus whether a live D-Bus call was actually
+/// issued to get it (false when `connection` is `None`, or when the value was
+/// served from an already-warm cached proxy).
 async fn get_time_in_state(
     connection: Option<&zbus::Connection>,
     unit: &ListedUnit,
-) -> Result<Option<u64>, MonitordUnitsError> {
-    match connection {
-        Some(c) => {
+    cache: Option<&RwLock<UnitPropertyCache>>,
+) -> Result<(Option<u64>, bool), MonitordUnitsError> {
+    let Some(c) = connection else {
+        error!("No zbus connection passed, but time_in_state_usecs enabled");
+        return Ok((None, false));
+    };
+    let now: u64 = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() * 1_000_000;
+
+    let (fetch_result, did_dbus_fetch) = match cache {
+        Some(cache) => {
+            match crate::dbus_props_cache::get_or_create_unit_proxy(
+                cache,
+                c,
+                &unit.name,
+                &unit.unit_object_path,
+            )
+            .await
+            {
+                Ok((entry, outcome)) => (
+                    entry.unit.state_change_timestamp().await,
+                    outcome == CacheOutcome::Bootstrap,
+                ),
+                Err(err) => (Err(err), true),
+            }
+        }
+        None => {
             let up = crate::dbus::zbus_unit::UnitProxy::builder(c)
                 .cache_properties(zbus::proxy::CacheProperties::No)
                 .path(ObjectPath::from(unit.unit_object_path.clone()))?
                 .build()
                 .await?;
-            let now: u64 = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() * 1_000_000;
-            let state_change_timestamp = match up.state_change_timestamp().await {
-                Ok(sct) => sct,
-                Err(err) => {
-                    error!(
-                        "Unable to get state_change_timestamp for {} - Setting to 0: {:?}",
-                        &unit.name, err,
-                    );
-                    0
-                }
-            };
-            Ok(Some(now - state_change_timestamp))
+            (up.state_change_timestamp().await, true)
         }
-        None => {
-            error!("No zbus connection passed, but time_in_state_usecs enabled");
-            Ok(None)
+    };
+
+    let state_change_timestamp = match fetch_result {
+        Ok(sct) => sct,
+        Err(err) => {
+            error!(
+                "Unable to get state_change_timestamp for {} - Setting to 0: {:?}",
+                &unit.name, err,
+            );
+            0
         }
-    }
+    };
+    Ok((Some(now - state_change_timestamp), did_dbus_fetch))
 }
 
-/// Parse state of a unit into our unit_states hash.
+/// Compute state for a unit: active/load state, computed health, and (if enabled)
+/// time-in-state.
 ///
-/// Returns true when an actual time-in-state D-Bus fetch was performed,
-/// so callers can keep `state_dbus_fetches` honest. Allowlist/blocklist
-/// short-circuits and `state_stats_time_in_state = false` both return false.
-pub async fn parse_state(
-    stats: &mut SystemdUnitStats,
+/// Returns `(None, false)` if the unit is filtered out by allow/blocklist - no
+/// entry should be inserted into `unit_states` for it. Otherwise returns
+/// `(Some(states), did_dbus_fetch)`, where `did_dbus_fetch` is true when an actual
+/// time-in-state D-Bus fetch was performed (so callers can keep `state_dbus_fetches`
+/// honest); serving a cached (already-warm) value counts as *not* a fetch, but
+/// still bumps `state_cache_hits`.
+///
+/// Takes no `&mut SystemdUnitStats` so it can run concurrently across units - the
+/// caller is responsible for inserting the returned entry.
+pub(crate) async fn parse_state(
     unit: &ListedUnit,
     config: &crate::config::UnitsConfig,
     connection: Option<&zbus::Connection>,
-) -> Result<bool, MonitordUnitsError> {
+    cache: Option<&RwLock<UnitPropertyCache>>,
+    state_cache_hits: &mut u64,
+) -> Result<(Option<UnitStates>, bool), MonitordUnitsError> {
     if config.state_stats_blocklist.contains(&unit.name) {
         debug!("Skipping state stats for {} due to blocklist", &unit.name);
-        return Ok(false);
+        return Ok((None, false));
     }
     if !config.state_stats_allowlist.is_empty()
         && !config.state_stats_allowlist.contains(&unit.name)
     {
-        return Ok(false);
+        return Ok((None, false));
     }
     let active_state = SystemdUnitActiveState::from_str(&unit.active_state)
         .unwrap_or(SystemdUnitActiveState::unknown);
@@ -400,7 +475,7 @@ pub async fn parse_state(
         && matches!(load_state, SystemdUnitLoadState::loaded)
     {
         if let Some(conn) = connection {
-            match is_oneshot_service_unit(conn, unit).await {
+            match is_oneshot_service_unit(conn, unit, cache, state_cache_hits).await {
                 Ok(is_oneshot) => is_oneshot_service = is_oneshot,
                 Err(err) => warn!(
                     "Unable to get Service.Type for {} (assuming not oneshot): {:?}",
@@ -414,33 +489,52 @@ pub async fn parse_state(
     let mut time_in_state_usecs: Option<u64> = None;
     let mut did_dbus_fetch = false;
     if config.state_stats_time_in_state {
-        time_in_state_usecs = get_time_in_state(connection, unit).await?;
-        // get_time_in_state only issues a D-Bus call when connection is Some;
-        // the None path logs an error and returns Ok(None) without calling out.
-        did_dbus_fetch = connection.is_some();
+        let (usecs, fetched) = get_time_in_state(connection, unit, cache).await?;
+        time_in_state_usecs = usecs;
+        did_dbus_fetch = fetched;
+        if connection.is_some() && cache.is_some() && !fetched {
+            *state_cache_hits += 1;
+        }
     }
 
-    stats.unit_states.insert(
-        unit.name.clone(),
-        UnitStates {
+    let states = UnitStates {
+        active_state,
+        load_state,
+        unhealthy: is_unit_unhealthy_for_service(
             active_state,
             load_state,
-            unhealthy: is_unit_unhealthy_for_service(
-                active_state,
-                load_state,
-                is_oneshot_service,
-                config.ignore_inactive_oneshot_services,
-            ),
-            time_in_state_usecs,
-        },
-    );
-    Ok(did_dbus_fetch)
+            is_oneshot_service,
+            config.ignore_inactive_oneshot_services,
+        ),
+        time_in_state_usecs,
+    };
+    Ok((Some(states), did_dbus_fetch))
 }
 
+/// `state_cache_hits` is bumped when the value was served from an already-warm
+/// cached proxy rather than a fresh live D-Bus call. Grouped under the "state"
+/// bucket (not "service") since this is only ever called from `parse_state`, as
+/// part of computing unit health - not from `parse_service`'s `[services]` stats.
 async fn is_oneshot_service_unit(
     connection: &zbus::Connection,
     unit: &ListedUnit,
+    cache: Option<&RwLock<UnitPropertyCache>>,
+    state_cache_hits: &mut u64,
 ) -> Result<bool, MonitordUnitsError> {
+    if let Some(cache) = cache {
+        let (service_proxy, outcome) = crate::dbus_props_cache::get_or_create_service_proxy(
+            cache,
+            connection,
+            &unit.name,
+            &unit.unit_object_path,
+        )
+        .await?;
+        if outcome == CacheOutcome::Hit {
+            *state_cache_hits += 1;
+        }
+        return Ok(service_proxy.type_().await? == "oneshot");
+    }
+
     let sp = crate::dbus::zbus_service::ServiceProxy::builder(connection)
         .cache_properties(zbus::proxy::CacheProperties::No)
         .path(ObjectPath::from(unit.unit_object_path.clone()))?
@@ -484,6 +578,151 @@ fn parse_unit(stats: &mut SystemdUnitStats, unit: &ListedUnit) {
     if unit.job_id != 0 {
         stats.jobs_queued += 1;
     }
+}
+
+/// Add one unit's type/load-state/active-state counts (as produced by `parse_unit`
+/// into a fresh, otherwise-default `SystemdUnitStats`) into the running aggregate.
+/// Only touches the scalar counters `parse_unit` sets - every other field on
+/// `source` is expected to be left at its default, since `process_unit` only ever
+/// calls `parse_unit` on a throwaway per-unit accumulator.
+fn merge_unit_type_state_counts(target: &mut SystemdUnitStats, source: &SystemdUnitStats) {
+    target.activating_units += source.activating_units;
+    target.active_units += source.active_units;
+    target.automount_units += source.automount_units;
+    target.device_units += source.device_units;
+    target.failed_units += source.failed_units;
+    target.inactive_units += source.inactive_units;
+    target.jobs_queued += source.jobs_queued;
+    target.loaded_units += source.loaded_units;
+    target.masked_units += source.masked_units;
+    target.mount_units += source.mount_units;
+    target.not_found_units += source.not_found_units;
+    target.path_units += source.path_units;
+    target.scope_units += source.scope_units;
+    target.service_units += source.service_units;
+    target.slice_units += source.slice_units;
+    target.socket_units += source.socket_units;
+    target.target_units += source.target_units;
+    target.timer_units += source.timer_units;
+}
+
+/// Per-unit result of `process_unit`, folded into the aggregate `SystemdUnitStats`
+/// and counters afterward. Carrying results out this way - rather than mutating
+/// shared state during processing - is what lets `parse_unit_state` run units
+/// concurrently instead of one at a time.
+struct PerUnitResult {
+    unit_name: String,
+    /// Only the scalar type/load/active-state counters are populated (via
+    /// `parse_unit`); every other field stays at `SystemdUnitStats::default()`.
+    counts: SystemdUnitStats,
+    unit_states_entry: Option<UnitStates>,
+    state_dbus_fetch: bool,
+    service_stats_entry: Option<ServiceStats>,
+    service_dbus_fetch: bool,
+    timer_stats_entry: Option<TimerStats>,
+    timer_dbus_fetch: bool,
+    state_cache_hits: u64,
+    service_cache_hits: u64,
+    timer_cache_hits: u64,
+}
+
+/// Collect everything for one unit: type/state counts, unit state, and (if
+/// configured) service/timer stats. Returns a `PerUnitResult` instead of mutating
+/// shared stats directly, so `parse_unit_state` can run this concurrently across
+/// units via `buffer_unordered`.
+async fn process_unit(
+    unit: ListedUnit,
+    config: &crate::config::Config,
+    connection: &zbus::Connection,
+    cache: Option<&RwLock<UnitPropertyCache>>,
+) -> PerUnitResult {
+    let mut counts = SystemdUnitStats::default();
+    parse_unit(&mut counts, &unit);
+
+    let mut result = PerUnitResult {
+        unit_name: unit.name.clone(),
+        counts,
+        unit_states_entry: None,
+        state_dbus_fetch: false,
+        service_stats_entry: None,
+        service_dbus_fetch: false,
+        timer_stats_entry: None,
+        timer_dbus_fetch: false,
+        state_cache_hits: 0,
+        service_cache_hits: 0,
+        timer_cache_hits: 0,
+    };
+
+    // Collect per unit state stats - ActiveState + LoadState. Not collecting
+    // SubState (yet).
+    if config.units.state_stats {
+        match parse_state(
+            &unit,
+            &config.units,
+            Some(connection),
+            cache,
+            &mut result.state_cache_hits,
+        )
+        .await
+        {
+            Ok((states, fetched)) => {
+                result.unit_states_entry = states;
+                result.state_dbus_fetch = fetched;
+            }
+            Err(err) => error!("Unable to parse state for {}: {:?}", &unit.name, err),
+        }
+    }
+
+    // Collect service stats
+    if config.services.contains(&unit.name) {
+        debug!("Collecting service stats for {:?}", &unit);
+        match parse_service(
+            connection,
+            &unit.name,
+            &unit.unit_object_path,
+            cache,
+            &mut result.service_cache_hits,
+        )
+        .await
+        {
+            Ok(service_stats) => {
+                result.service_stats_entry = Some(service_stats);
+                result.service_dbus_fetch = true;
+            }
+            Err(err) => error!(
+                "Unable to get service stats for {} {}: {:#?}",
+                &unit.name, &unit.unit_object_path, err
+            ),
+        }
+    }
+
+    // Collect timer stats
+    if config.timers.enabled && unit.name.contains(".timer") {
+        if config.timers.blocklist.contains(&unit.name) {
+            debug!("Skipping timer stats for {} due to blocklist", &unit.name);
+        } else if !config.timers.allowlist.is_empty()
+            && !config.timers.allowlist.contains(&unit.name)
+        {
+            // Outside the configured allowlist - nothing to collect.
+        } else {
+            match crate::timer::collect_timer_stats(
+                connection,
+                &unit,
+                cache,
+                &mut result.timer_cache_hits,
+            )
+            .await
+            {
+                Ok(ts) => {
+                    result.timer_dbus_fetch = true;
+                    result.timer_stats_entry = Some(ts);
+                }
+                Err(err) => error!("Failed to get {} stats: {:#?}", &unit.name, err),
+            }
+        }
+    }
+
+    result
 }
 
 const TRANSIENT_DIR: &str = "/run/systemd/transient";
@@ -607,10 +846,13 @@ pub async fn collect_unit_files_stats(fs_root: &str) -> UnitFilesStats {
 }
 
 /// Pull all units from dbus and count how system is setup and behaving
-pub async fn parse_unit_state(
+/// `cache` enables the daemon-mode-only cached property path (`dbus_props_cache.rs`)
+/// for this run; pass `None` for the default stateless behavior.
+pub(crate) async fn parse_unit_state(
     config: &crate::config::Config,
     connection: &zbus::Connection,
     fs_root: &str,
+    cache: Option<&RwLock<UnitPropertyCache>>,
 ) -> Result<SystemdUnitStats, MonitordUnitsError> {
     if !config.units.state_stats_allowlist.is_empty() {
         debug!(
@@ -659,72 +901,86 @@ pub async fn parse_unit_state(
     let units = units_result?;
     stats.total_units = units.len() as u64;
 
+    // Evict cache entries for units no longer listed by systemd (stopped/transient
+    // unit gone, etc). The current unit-name set is already known for free here -
+    // list_units() runs every cycle regardless of caching strategy.
+    if let Some(cache) = cache {
+        let current_names: HashSet<String> = units.iter().map(|u| u.0.clone()).collect();
+        let mut guard = cache.write().await;
+        let cached_names: HashSet<String> = guard.keys().cloned().collect();
+        for name in crate::dbus_props_cache::unit_names_to_evict(&cached_names, &current_names) {
+            guard.remove(&name);
+        }
+    }
+
     let per_unit_loop_start = Instant::now();
+
+    // Bounded so a cold cache on a large host (500+ units is common) doesn't fire
+    // hundreds of simultaneous D-Bus calls at once - which would work against the
+    // entire point of the cached property path (reducing burst load on dbus-broker).
+    const PER_UNIT_CONCURRENCY: usize = 16;
+    let results: Vec<PerUnitResult> = futures_util::stream::iter(units)
+        .map(|unit_raw| process_unit(ListedUnit::from(unit_raw), config, connection, cache))
+        .buffer_unordered(PER_UNIT_CONCURRENCY)
+        .collect()
+        .await;
+
     let mut state_dbus_fetches: u64 = 0;
     let mut service_dbus_fetches: u64 = 0;
     let mut timer_dbus_fetches: u64 = 0;
+    let mut state_cache_hits: u64 = 0;
+    let mut service_cache_hits: u64 = 0;
+    let mut timer_cache_hits: u64 = 0;
 
-    for unit_raw in units {
-        let unit: ListedUnit = unit_raw.into();
-        // Collect unit types + states counts
-        parse_unit(&mut stats, &unit);
+    // Fold every unit's result into the aggregate. Single-threaded, no locking
+    // needed - all concurrent work already finished above. Merge order doesn't
+    // affect correctness: entries are keyed by unit name and each unit was
+    // processed exactly once, and counters are plain sums.
+    for result in results {
+        merge_unit_type_state_counts(&mut stats, &result.counts);
 
-        // Collect per unit state stats - ActiveState + LoadState
-        // Not collecting SubState (yet)
-        if config.units.state_stats {
-            let did_dbus_fetch =
-                parse_state(&mut stats, &unit, &config.units, Some(connection)).await?;
-            if did_dbus_fetch {
-                state_dbus_fetches += 1;
-            }
+        if let Some(states) = result.unit_states_entry {
+            stats.unit_states.insert(result.unit_name.clone(), states);
+        }
+        if result.state_dbus_fetch {
+            state_dbus_fetches += 1;
         }
 
-        // Collect service stats
-        if config.services.contains(&unit.name) {
-            debug!("Collecting service stats for {:?}", &unit);
-            match parse_service(connection, &unit.name, &unit.unit_object_path).await {
-                Ok(service_stats) => {
-                    stats.service_stats.insert(unit.name.clone(), service_stats);
-                    service_dbus_fetches += 1;
-                }
-                Err(err) => error!(
-                    "Unable to get service stats for {} {}: {:#?}",
-                    &unit.name, &unit.unit_object_path, err
-                ),
-            }
+        if let Some(service_stats) = result.service_stats_entry {
+            stats
+                .service_stats
+                .insert(result.unit_name.clone(), service_stats);
+        }
+        if result.service_dbus_fetch {
+            service_dbus_fetches += 1;
         }
 
-        // Collect timer stats
-        if config.timers.enabled && unit.name.contains(".timer") {
-            if config.timers.blocklist.contains(&unit.name) {
-                debug!("Skipping timer stats for {} due to blocklist", &unit.name);
-                continue;
+        if let Some(timer_stats) = result.timer_stats_entry {
+            if timer_stats.persistent {
+                stats.timer_persistent_units += 1;
             }
-            if !config.timers.allowlist.is_empty() && !config.timers.allowlist.contains(&unit.name)
-            {
-                continue;
+            if timer_stats.remain_after_elapse {
+                stats.timer_remain_after_elapse += 1;
             }
-            let timer_stats: Option<TimerStats> =
-                match crate::timer::collect_timer_stats(connection, &mut stats, &unit).await {
-                    Ok(ts) => {
-                        timer_dbus_fetches += 1;
-                        Some(ts)
-                    }
-                    Err(err) => {
-                        error!("Failed to get {} stats: {:#?}", &unit.name, err);
-                        None
-                    }
-                };
-            if let Some(ts) = timer_stats {
-                stats.timer_stats.insert(unit.name.clone(), ts);
-            }
+            stats.timer_stats.insert(result.unit_name, timer_stats);
         }
+        if result.timer_dbus_fetch {
+            timer_dbus_fetches += 1;
+        }
+
+        state_cache_hits += result.state_cache_hits;
+        service_cache_hits += result.service_cache_hits;
+        timer_cache_hits += result.timer_cache_hits;
     }
+
     let per_unit_loop_elapsed = per_unit_loop_start.elapsed();
     stats.collection_timings.per_unit_loop_ms = per_unit_loop_elapsed.as_secs_f64() * 1000.0;
     stats.collection_timings.state_dbus_fetches = state_dbus_fetches;
     stats.collection_timings.service_dbus_fetches = service_dbus_fetches;
     stats.collection_timings.timer_dbus_fetches = timer_dbus_fetches;
+    stats.collection_timings.state_cache_hits = state_cache_hits;
+    stats.collection_timings.service_cache_hits = service_cache_hits;
+    stats.collection_timings.timer_cache_hits = timer_cache_hits;
 
     debug!("unit stats: {:?}", stats);
     Ok(stats)
@@ -733,14 +989,18 @@ pub async fn parse_unit_state(
 /// Async wrapper that can update unit stats when passed a locked struct.
 /// `fs_root` is prepended to filesystem paths for unit file stats —
 /// empty string for the host, `/proc/<pid>/root` for containers.
-pub async fn update_unit_stats(
+///
+/// `cache` enables the daemon-mode-only cached property path for this run; pass
+/// `None` for the default stateless behavior (see `dbus_props_cache.rs`).
+pub(crate) async fn update_unit_stats(
     config: Arc<crate::config::Config>,
     connection: zbus::Connection,
     locked_machine_stats: Arc<RwLock<MachineStats>>,
     fs_root: String,
+    cache: Option<Arc<RwLock<UnitPropertyCache>>>,
 ) -> anyhow::Result<()> {
     let mut machine_stats = locked_machine_stats.write().await;
-    match parse_unit_state(&config, &connection, &fs_root).await {
+    match parse_unit_state(&config, &connection, &fs_root, cache.as_deref()).await {
         Ok(units_stats) => machine_stats.units = units_stats,
         Err(err) => error!("units stats failed: {:?}", err),
     }
@@ -777,69 +1037,35 @@ mod tests {
     #[tokio::test]
     async fn test_state_parse() -> Result<(), MonitordUnitsError> {
         let test_unit_name = String::from("apport-autoreport.timer");
-        let expected_stats = SystemdUnitStats {
-            activating_units: 0,
-            active_units: 0,
-            automount_units: 0,
-            device_units: 0,
-            failed_units: 0,
-            inactive_units: 0,
-            jobs_queued: 0,
-            loaded_units: 0,
-            masked_units: 0,
-            mount_units: 0,
-            not_found_units: 0,
-            path_units: 0,
-            scope_units: 0,
-            service_units: 0,
-            slice_units: 0,
-            socket_units: 0,
-            target_units: 0,
-            timer_units: 0,
-            timer_persistent_units: 0,
-            timer_remain_after_elapse: 0,
-            total_units: 0,
-            unit_files: UnitFilesStats::default(),
-            service_stats: HashMap::new(),
-            timer_stats: HashMap::new(),
-            unit_states: HashMap::from([(
-                test_unit_name.clone(),
-                UnitStates {
-                    active_state: SystemdUnitActiveState::inactive,
-                    load_state: SystemdUnitLoadState::loaded,
-                    unhealthy: true,
-                    time_in_state_usecs: None,
-                },
-            )]),
-            collection_timings: UnitsCollectionTimings::default(),
+        let expected_states = UnitStates {
+            active_state: SystemdUnitActiveState::inactive,
+            load_state: SystemdUnitLoadState::loaded,
+            unhealthy: true,
+            time_in_state_usecs: None,
         };
-        let mut stats = SystemdUnitStats::default();
         let systemd_unit = get_unit_file();
         let mut config = crate::config::UnitsConfig::default();
 
         // Test no allow list or blocklist; with connection: None, parse_state
         // takes the no-op path inside get_time_in_state and returns false.
-        let did_fetch = parse_state(&mut stats, &systemd_unit, &config, None).await?;
-        assert_eq!(expected_stats, stats);
+        let (states, did_fetch) = parse_state(&systemd_unit, &config, None, None, &mut 0).await?;
+        assert_eq!(Some(expected_states.clone()), states);
         assert!(!did_fetch);
 
         // Create an allow list
         config.state_stats_allowlist = HashSet::from([test_unit_name.clone()]);
 
         // test no blocklist and only allow list - Should equal the same as no lists above
-        let mut allowlist_stats = SystemdUnitStats::default();
-        let did_fetch = parse_state(&mut allowlist_stats, &systemd_unit, &config, None).await?;
-        assert_eq!(expected_stats, allowlist_stats);
+        let (states, did_fetch) = parse_state(&systemd_unit, &config, None, None, &mut 0).await?;
+        assert_eq!(Some(expected_states), states);
         assert!(!did_fetch);
 
         // Now add a blocklist
         config.state_stats_blocklist = HashSet::from([test_unit_name]);
 
         // test blocklist with allow list (show it's preferred)
-        let mut blocklist_stats = SystemdUnitStats::default();
-        let expected_blocklist_stats = SystemdUnitStats::default();
-        let did_fetch = parse_state(&mut blocklist_stats, &systemd_unit, &config, None).await?;
-        assert_eq!(expected_blocklist_stats, blocklist_stats);
+        let (states, did_fetch) = parse_state(&systemd_unit, &config, None, None, &mut 0).await?;
+        assert_eq!(None, states);
         // Blocklist short-circuit must NOT count as a D-Bus fetch.
         assert!(!did_fetch);
         Ok(())
@@ -890,6 +1116,36 @@ mod tests {
         assert_eq!(stats.activating_units, 1);
         assert_eq!(stats.active_units, 0);
         assert_eq!(stats.inactive_units, 0);
+    }
+
+    /// Covers the fold step that lets `parse_unit_state` run units concurrently:
+    /// two units' independently-computed counts (as `process_unit` would produce
+    /// via a throwaway per-unit `SystemdUnitStats`) must sum correctly into the
+    /// aggregate, with no cross-contamination between unrelated counters.
+    #[test]
+    fn test_merge_unit_type_state_counts_sums_independently() {
+        let mut timer_unit = SystemdUnitStats::default();
+        parse_unit(&mut timer_unit, &get_unit_file()); // inactive, loaded, .timer
+
+        let mut activating_service = SystemdUnitStats::default();
+        let mut unit = get_unit_file();
+        unit.name = String::from("something.service");
+        unit.active_state = String::from("activating");
+        parse_unit(&mut activating_service, &unit);
+
+        let mut aggregate = SystemdUnitStats::default();
+        merge_unit_type_state_counts(&mut aggregate, &timer_unit);
+        merge_unit_type_state_counts(&mut aggregate, &activating_service);
+
+        assert_eq!(aggregate.timer_units, 1);
+        assert_eq!(aggregate.inactive_units, 1);
+        assert_eq!(aggregate.loaded_units, 2); // both units are "loaded"
+        assert_eq!(aggregate.service_units, 1);
+        assert_eq!(aggregate.activating_units, 1);
+        // Nothing else should have picked up a stray count.
+        assert_eq!(aggregate.active_units, 0);
+        assert_eq!(aggregate.failed_units, 0);
+        assert_eq!(aggregate.automount_units, 0);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use std::time::Instant;
 
+use futures_util::StreamExt;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -24,6 +25,7 @@ pub enum MonitordError {
 pub mod boot;
 pub mod config;
 pub(crate) mod dbus;
+pub(crate) mod dbus_props_cache;
 pub mod dbus_stats;
 pub mod json;
 pub mod logging;
@@ -141,6 +143,22 @@ fn set_stat_collection_run_time(stats: &mut MonitordStats, elapsed_runtime: Dura
     stats.stat_collection_run_time_ms = elapsed_runtime.as_secs_f64() * 1000.0;
 }
 
+/// Whether the cached D-Bus property path (`dbus_props_cache.rs`) should actually
+/// be used this run. It only pays off across multiple daemon cycles - a one-shot
+/// run exits before any cache reuse can happen - so it's gated on daemon mode
+/// regardless of the `[dbus_property_cache]` config flag.
+fn should_use_property_cache(cache_enabled: bool, daemon: bool) -> bool {
+    cache_enabled && daemon
+}
+
+/// Whether to log the one-time notice that containers won't benefit from the
+/// cached property path - the cache is host-only in this release (see
+/// `dbus_props_cache.rs`), so an operator running containers with the cache
+/// enabled should know only host units are affected.
+fn should_warn_about_container_bypass(use_property_cache: bool, machines_enabled: bool) -> bool {
+    use_property_cache && machines_enabled
+}
+
 /// Output produced by every spawned collector future after wrapping with timing.
 type TimedCollectorOutput = (String, anyhow::Result<()>, Duration, Duration);
 
@@ -203,8 +221,65 @@ pub async fn stat_collector(
         Arc::new(RwLock::new(MachineStats::default()));
     let cached_machine_connections: Arc<tokio::sync::Mutex<machines::MachineConnections>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let cached_unit_property_proxies: Arc<RwLock<dbus_props_cache::UnitPropertyCache>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let use_property_cache =
+        should_use_property_cache(config.dbus_property_cache.enabled, config.monitord.daemon);
+    if config.dbus_property_cache.enabled && !config.monitord.daemon {
+        warn!(
+            "dbus_property_cache.enabled has no effect outside daemon mode (one-shot run exits \
+             before any cache reuse can happen)"
+        );
+    }
+    if should_warn_about_container_bypass(use_property_cache, config.machines.enabled) {
+        info!(
+            "dbus_property_cache is host-only in this release - containers under [machines] \
+             will keep using the stateless property path regardless of this setting"
+        );
+    }
     std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", &config.monitord.dbus_address);
     let sdc = get_or_create_dbus_connection(&config, maybe_connection).await?;
+
+    if use_property_cache {
+        let cache_for_evictor = cached_unit_property_proxies.clone();
+        let sdc_for_evictor = sdc.clone();
+        tokio::spawn(async move {
+            let manager = match crate::dbus::zbus_systemd::ManagerProxy::builder(&sdc_for_evictor)
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await
+            {
+                Ok(m) => m,
+                Err(err) => {
+                    warn!(
+                        "Failed to build Manager proxy for UnitRemoved eviction listener: {:?}",
+                        err
+                    );
+                    return;
+                }
+            };
+            let mut removed_stream = match manager.receive_unit_removed().await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!("Failed to subscribe to UnitRemoved signal: {:?}", err);
+                    return;
+                }
+            };
+            while let Some(signal) = removed_stream.next().await {
+                match signal.args() {
+                    Ok(args) => {
+                        dbus_props_cache::evict_unit(&cache_for_evictor, args.id()).await;
+                    }
+                    Err(err) => warn!("Failed to parse UnitRemoved signal args: {:?}", err),
+                }
+            }
+            warn!(
+                "UnitRemoved signal stream ended - cache eviction now relies solely on the \
+                 per-cycle diff until the next process restart"
+            );
+        });
+    }
+
     let mut join_set: tokio::task::JoinSet<TimedCollectorOutput> = tokio::task::JoinSet::new();
     let mut had_error;
 
@@ -278,6 +353,11 @@ pub async fn stat_collector(
             let config_clone = Arc::clone(&config);
             let sdc_clone = sdc.clone();
             let stats_clone = locked_machine_stats.clone();
+            let cache_clone = if use_property_cache {
+                Some(cached_unit_property_proxies.clone())
+            } else {
+                None
+            };
             spawn_timed(&mut join_set, "units", collect_start_time, async move {
                 if config_clone.varlink.enabled {
                     let socket_path = crate::varlink_units::METRICS_SOCKET_PATH.to_string();
@@ -320,8 +400,14 @@ pub async fn stat_collector(
                         }
                     }
                 }
-                crate::units::update_unit_stats(config_clone, sdc_clone, stats_clone, String::new())
-                    .await
+                crate::units::update_unit_stats(
+                    config_clone,
+                    sdc_clone,
+                    stats_clone,
+                    String::new(),
+                    cache_clone,
+                )
+                .await
             });
         }
 
@@ -482,5 +568,28 @@ mod tests {
 
         set_stat_collection_run_time(&mut stats, Duration::from_micros(500));
         assert!((stats.stat_collection_run_time_ms - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_property_cache_requires_daemon_mode() {
+        // The only combination that actually turns the cache on.
+        assert!(should_use_property_cache(true, true));
+        // Flag set but one-shot mode: must NOT enable the cache.
+        assert!(!should_use_property_cache(true, false));
+        // Daemon mode but flag unset: must NOT enable the cache.
+        assert!(!should_use_property_cache(false, true));
+        // Neither set: must NOT enable the cache.
+        assert!(!should_use_property_cache(false, false));
+    }
+
+    #[test]
+    fn test_container_bypass_notice_only_when_both_apply() {
+        // Cache actually in use and containers enabled: operator should be told.
+        assert!(should_warn_about_container_bypass(true, true));
+        // Cache not in use: nothing to warn about, regardless of machines.
+        assert!(!should_warn_about_container_bypass(false, true));
+        // No containers: nothing to warn about, regardless of the cache.
+        assert!(!should_warn_about_container_bypass(true, false));
+        assert!(!should_warn_about_container_bypass(false, false));
     }
 }

@@ -451,6 +451,9 @@ plus an inner phase breakdown for the units collector
 | `collection_timings.timer_dbus_fetches` | Count of timer D-Bus property fetches this run. |
 | `collection_timings.state_dbus_fetches` | Count of unit-state D-Bus fetches (only when `state_stats_time_in_state` is enabled). |
 | `collection_timings.service_dbus_fetches` | Count of per-service D-Bus property fetches. |
+| `collection_timings.state_cache_hits` | Count of unit-state property reads (time-in-state + oneshot check) served from an already-warm cached proxy this run. Always 0 unless `[dbus_property_cache].enabled = true` — see [Cached D-Bus property path](#cached-d-bus-property-path). |
+| `collection_timings.service_cache_hits` | Same, for per-service property reads. |
+| `collection_timings.timer_cache_hits` | Same, for per-timer property reads. |
 
 Comparing `sum(collector_timings.*.elapsed_ms)` against
 `stat_collection_run_time_ms` gives an effective parallelism ratio
@@ -720,6 +723,47 @@ systemd Dbus APIs are in use in the following modules:
 
 Some of these modules can be disabled via configuration. Due to this, monitord might not
 always be running / calling all these DBus calls per run.
+
+## Cached D-Bus property path
+
+By default, every collection cycle rebuilds a fresh D-Bus proxy for each unit and
+issues a live property fetch — correct, but it re-fetches values that often haven't
+changed since the last cycle, every `daemon_stats_refresh_secs` in daemon mode.
+
+For long-running daemon-mode deployments, monitord can instead keep long-lived
+proxies across collection cycles and let [zbus](https://crates.io/crates/zbus)'s
+built-in property caching serve repeat reads for free: a property is fetched once,
+then kept warm via zbus's internal `PropertiesChanged` subscription for as long as
+the proxy stays alive, with **zero new D-Bus calls** on subsequent cycles until the
+unit's value actually changes or the unit itself disappears.
+
+This is opt-in and coexists with the default path rather than replacing it — enable
+it with:
+
+```ini
+[dbus_property_cache]
+enabled = true
+```
+
+A few things worth knowing before turning it on:
+
+- **Daemon mode only.** The flag has no effect when `daemon = false` — a one-shot
+  run exits before there's a second cycle to benefit from a warm cache. monitord
+  logs a warning at startup if you enable the flag without daemon mode.
+- **Host units only, in this first pass.** Units inside systemd-nspawn containers
+  (`[machines]`) still use the default stateless path regardless of this setting.
+  monitord logs an info notice at startup if both the cache and `[machines]` are
+  enabled together, so this isn't a silent gap.
+- **Covers the per-unit-loop collectors.** Applies to unit state/time-in-state,
+  oneshot-service detection, per-service stats (`[services]`), and per-timer stats
+  (`[timers]`). Boot blame (`[boot]`) already has its own cross-run cache
+  (`cache_enabled`) and isn't affected by this setting.
+- **Observability:** `collection_timings.{state,service,timer}_cache_hits` in the
+  output stats count how many property reads were served from a warm cache this
+  cycle, split the same way `state_dbus_fetches` / `service_dbus_fetches` /
+  `timer_dbus_fetches` already are — so you can see which collector is actually
+  benefiting (hits should climb as that collector's cache warms up, its matching
+  fetch counter should approach zero for a stable set of units).
 
 ## Varlink
 

@@ -7,8 +7,6 @@ use struct_field_names_as_array::FieldNamesAsArray;
 use thiserror::Error;
 use tracing::error;
 
-use crate::units::SystemdUnitStats;
-
 #[derive(Error, Debug)]
 pub enum MonitordTimerError {
     #[error("Timer D-Bus error: {0}")]
@@ -48,18 +46,46 @@ pub struct TimerStats {
 
 pub const TIMER_STATS_FIELD_NAMES: &[&str] = &TimerStats::FIELD_NAMES_AS_ARRAY;
 
-pub async fn collect_timer_stats(
+/// `cache` enables the daemon-mode-only cached property path (`dbus_props_cache.rs`)
+/// for this call; pass `None` for the default stateless behavior. `timer_cache_hits`
+/// is bumped once per proxy (timer, and the triggered service's unit, if any) that
+/// was already warm rather than freshly built.
+///
+/// Takes no `&mut SystemdUnitStats` so it can run concurrently across units - the
+/// caller is responsible for folding `timer_persistent_units`/`timer_remain_after_elapse`
+/// from the returned `TimerStats`.
+pub(crate) async fn collect_timer_stats(
     connection: &zbus::Connection,
-    stats: &mut SystemdUnitStats,
     unit: &crate::units::ListedUnit,
+    cache: Option<&tokio::sync::RwLock<crate::dbus_props_cache::UnitPropertyCache>>,
+    timer_cache_hits: &mut u64,
 ) -> Result<TimerStats, MonitordTimerError> {
+    use crate::dbus_props_cache::CacheOutcome;
+
     let mut timer_stats = TimerStats::default();
 
-    let pt = crate::dbus::zbus_timer::TimerProxy::builder(connection)
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .path(unit.unit_object_path.clone())?
-        .build()
-        .await?;
+    let pt = match cache {
+        Some(cache) => {
+            let (entry, outcome) = crate::dbus_props_cache::get_or_create_timer_proxy(
+                cache,
+                connection,
+                &unit.name,
+                &unit.unit_object_path,
+            )
+            .await?;
+            if outcome == CacheOutcome::Hit {
+                *timer_cache_hits += 1;
+            }
+            entry
+        }
+        None => {
+            crate::dbus::zbus_timer::TimerProxy::builder(connection)
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .path(unit.unit_object_path.clone())?
+                .build()
+                .await?
+        }
+    };
     // Get service unit name to check when it last ran to ensure
     // we are triggers the configured service with times set
     let service_unit = pt.unit().await?;
@@ -68,18 +94,38 @@ pub async fn collect_timer_stats(
     if service_unit.is_empty() {
         error!("{}: No service unit name found for timer.", unit.name);
     } else {
-        // Get the object path of the service unit
+        // GetUnit stays a live method call in both paths - it's a method, not a
+        // cacheable property.
         let mp = crate::dbus::zbus_systemd::ManagerProxy::builder(connection)
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
             .await?;
         let service_unit_path = mp.get_unit(&service_unit).await?;
-        // Create a UnitProxy with the unit path to async get the two counters we want
-        let up = crate::dbus::zbus_unit::UnitProxy::builder(connection)
-            .cache_properties(zbus::proxy::CacheProperties::No)
-            .path(service_unit_path)?
-            .build()
-            .await?;
+
+        let up = match cache {
+            // The triggered service is a different unit from the timer itself, so
+            // it gets its own separate cache entry, keyed by its own name.
+            Some(cache) => {
+                let (entry, outcome) = crate::dbus_props_cache::get_or_create_unit_proxy(
+                    cache,
+                    connection,
+                    &service_unit,
+                    &service_unit_path,
+                )
+                .await?;
+                if outcome == CacheOutcome::Hit {
+                    *timer_cache_hits += 1;
+                }
+                entry.unit
+            }
+            None => {
+                crate::dbus::zbus_unit::UnitProxy::builder(connection)
+                    .cache_properties(zbus::proxy::CacheProperties::No)
+                    .path(service_unit_path)?
+                    .build()
+                    .await?
+            }
+        };
 
         (
             service_unit_last_state_change_usec,
@@ -127,14 +173,6 @@ pub async fn collect_timer_stats(
     timer_stats.randomized_delay_usec = randomized_delay_usec?;
     timer_stats.remain_after_elapse = remain_after_elapse?;
 
-    if timer_stats.persistent {
-        stats.timer_persistent_units += 1;
-    }
-
-    if timer_stats.remain_after_elapse {
-        stats.timer_remain_after_elapse += 1;
-    }
-
     Ok(timer_stats)
 }
 
@@ -175,8 +213,16 @@ pub async fn collect_all_timers_dbus(
         if !config.timers.allowlist.is_empty() && !config.timers.allowlist.contains(&unit.name) {
             continue;
         }
-        match collect_timer_stats(connection, &mut stats, &unit).await {
+        // No cache: this varlink-fallback path isn't wired into the daemon-mode
+        // cached property path in this first pass (see dbus_props_cache.rs).
+        match collect_timer_stats(connection, &unit, None, &mut 0).await {
             Ok(ts) => {
+                if ts.persistent {
+                    stats.timer_persistent_units += 1;
+                }
+                if ts.remain_after_elapse {
+                    stats.timer_remain_after_elapse += 1;
+                }
                 timer_stats_map.insert(unit.name.clone(), ts);
             }
             Err(err) => {

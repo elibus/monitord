@@ -227,6 +227,15 @@ pub struct VarlinkConfig {
     pub enabled: bool,
 }
 
+/// Toggles the cached D-Bus property path (`src/dbus_props_cache.rs`) as an
+/// alternative to the default stateless per-cycle fetch path, where a fresh proxy
+/// is built and its properties fetched live on every collection cycle. Only has
+/// any effect in daemon mode - one-shot runs exit before any cache reuse can happen.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DbusPropertyCacheConfig {
+    pub enabled: bool,
+}
+
 /// Config struct
 /// Each section represents an ini file section
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -243,6 +252,7 @@ pub struct Config {
     pub boot_blame: BootBlameConfig,
     pub verify: VerifyConfig,
     pub varlink: VarlinkConfig,
+    pub dbus_property_cache: DbusPropertyCacheConfig,
 }
 
 impl TryFrom<Ini> for Config {
@@ -414,6 +424,10 @@ impl TryFrom<Ini> for Config {
         // [varlink] section
         config.varlink.enabled = read_config_bool(&ini_config, "varlink", "enabled")?;
 
+        // [dbus_property_cache] section
+        config.dbus_property_cache.enabled =
+            read_config_bool(&ini_config, "dbus_property_cache", "enabled")?;
+
         Ok(config)
     }
 }
@@ -561,6 +575,9 @@ bar.service
 
 [varlink]
 enabled = true
+
+[dbus_property_cache]
+enabled = true
 "###;
 
     const MINIMAL_CONFIG: &str = r###"
@@ -593,6 +610,8 @@ output_format = json-flat
         );
         // See that one of the enabled bools are false
         assert!(!expected_config.networkd.enabled);
+        // dbus_property_cache defaults to disabled when not configured
+        assert!(!expected_config.dbus_property_cache.enabled);
         // Boot cache defaults to enabled when not explicitly configured
         assert!(expected_config.boot_blame.cache_enabled);
         // Oneshot inactive services are ignored by default
@@ -687,6 +706,7 @@ ignore_inactive_oneshot_services = false
                 blocklist: HashSet::new(),
             },
             varlink: VarlinkConfig { enabled: true },
+            dbus_property_cache: DbusPropertyCacheConfig { enabled: true },
         };
 
         let mut monitord_config = NamedTempFile::new().expect("Unable to make named tempfile");
