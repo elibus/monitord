@@ -24,6 +24,7 @@ pub enum MonitordError {
 pub mod boot;
 pub mod config;
 pub(crate) mod dbus;
+pub(crate) mod dbus_props;
 pub mod dbus_stats;
 pub mod json;
 pub mod logging;

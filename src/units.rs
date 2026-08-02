@@ -29,6 +29,7 @@ pub enum MonitordUnitsError {
     SystemTimeError(#[from] std::time::SystemTimeError),
 }
 
+use crate::dbus_props::extract_property;
 use crate::timer::TimerStats;
 use crate::MachineStats;
 
@@ -261,7 +262,12 @@ pub const SERVICE_FIELD_NAMES: &[&str] = &ServiceStats::FIELD_NAMES_AS_ARRAY;
 pub const UNIT_FIELD_NAMES: &[&str] = &SystemdUnitStats::FIELD_NAMES_AS_ARRAY;
 pub const UNIT_STATES_FIELD_NAMES: &[&str] = &UnitStates::FIELD_NAMES_AS_ARRAY;
 
-/// Pull out selected systemd service statistics
+/// Pull out selected systemd service statistics.
+///
+/// Fetches the `Unit` and `Service` interface properties via two
+/// `Properties.GetAll` calls instead of 15 individual `Properties.Get`
+/// round trips (`GetProcesses` remains a separate call since it's a method,
+/// not a property).
 async fn parse_service(
     connection: &zbus::Connection,
     name: &str,
@@ -274,67 +280,37 @@ async fn parse_service(
         .path(object_path.clone())?
         .build()
         .await?;
-    let up = crate::dbus::zbus_unit::UnitProxy::builder(connection)
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .path(object_path.clone())?
-        .build()
-        .await?;
+    let path = ObjectPath::from(object_path.clone());
 
-    // Use tokio::join! without tokio::spawn to avoid per-task allocation overhead.
-    // These all share the same D-Bus connection so spawn adds no parallelism benefit.
-    let (
-        active_enter_timestamp,
-        active_exit_timestamp,
-        cpuusage_nsec,
-        inactive_exit_timestamp,
-        ioread_bytes,
-        ioread_operations,
-        memory_current,
-        memory_available,
-        nrestarts,
-        processes,
-        restart_usec,
-        state_change_timestamp,
-        status_errno,
-        tasks_current,
-        timeout_clean_usec,
-        watchdog_usec,
-    ) = tokio::join!(
-        up.active_enter_timestamp(),
-        up.active_exit_timestamp(),
-        sp.cpuusage_nsec(),
-        up.inactive_exit_timestamp(),
-        sp.ioread_bytes(),
-        sp.ioread_operations(),
-        sp.memory_current(),
-        sp.memory_available(),
-        sp.nrestarts(),
+    let (unit_props, service_props, processes) = tokio::join!(
+        crate::dbus_props::get_all_properties(connection, &path, "org.freedesktop.systemd1.Unit"),
+        crate::dbus_props::get_all_properties(
+            connection,
+            &path,
+            "org.freedesktop.systemd1.Service"
+        ),
         sp.get_processes(),
-        sp.restart_usec(),
-        up.state_change_timestamp(),
-        sp.status_errno(),
-        sp.tasks_current(),
-        sp.timeout_clean_usec(),
-        sp.watchdog_usec(),
     );
+    let unit_props = unit_props?;
+    let service_props = service_props?;
 
     Ok(ServiceStats {
-        active_enter_timestamp: active_enter_timestamp?,
-        active_exit_timestamp: active_exit_timestamp?,
-        cpuusage_nsec: cpuusage_nsec?,
-        inactive_exit_timestamp: inactive_exit_timestamp?,
-        ioread_bytes: ioread_bytes?,
-        ioread_operations: ioread_operations?,
-        memory_current: memory_current?,
-        memory_available: memory_available?,
-        nrestarts: nrestarts?,
+        active_enter_timestamp: extract_property(&unit_props, "ActiveEnterTimestamp")?,
+        active_exit_timestamp: extract_property(&unit_props, "ActiveExitTimestamp")?,
+        cpuusage_nsec: extract_property(&service_props, "CPUUsageNSec")?,
+        inactive_exit_timestamp: extract_property(&unit_props, "InactiveExitTimestamp")?,
+        ioread_bytes: extract_property(&service_props, "IOReadBytes")?,
+        ioread_operations: extract_property(&service_props, "IOReadOperations")?,
+        memory_current: extract_property(&service_props, "MemoryCurrent")?,
+        memory_available: extract_property(&service_props, "MemoryAvailable")?,
+        nrestarts: extract_property(&service_props, "NRestarts")?,
         processes: processes?.len().try_into()?,
-        restart_usec: restart_usec?,
-        state_change_timestamp: state_change_timestamp?,
-        status_errno: status_errno?,
-        tasks_current: tasks_current?,
-        timeout_clean_usec: timeout_clean_usec?,
-        watchdog_usec: watchdog_usec?,
+        restart_usec: extract_property(&service_props, "RestartUSec")?,
+        state_change_timestamp: extract_property(&unit_props, "StateChangeTimestamp")?,
+        status_errno: extract_property(&service_props, "StatusErrno")?,
+        tasks_current: extract_property(&service_props, "TasksCurrent")?,
+        timeout_clean_usec: extract_property(&service_props, "TimeoutCleanUSec")?,
+        watchdog_usec: extract_property(&service_props, "WatchdogUSec")?,
     })
 }
 
