@@ -369,28 +369,52 @@ pub async fn parse_state(
         .unwrap_or(SystemdUnitActiveState::unknown);
     let load_state = SystemdUnitLoadState::from_str(&unit.load_state.replace('-', "_"))
         .unwrap_or(SystemdUnitLoadState::unknown);
-    let mut is_oneshot_service = false;
-    if config.ignore_inactive_oneshot_services
+
+    let needs_oneshot_check = config.ignore_inactive_oneshot_services
         && unit.name.ends_with(SYSTEMD_SERVICE_SUFFIX)
         && matches!(active_state, SystemdUnitActiveState::inactive)
-        && matches!(load_state, SystemdUnitLoadState::loaded)
-    {
-        if let Some(conn) = connection {
-            match is_oneshot_service_unit(conn, unit).await {
-                Ok(is_oneshot) => is_oneshot_service = is_oneshot,
-                Err(err) => warn!(
-                    "Unable to get Service.Type for {} (assuming not oneshot): {:?}",
-                    &unit.name, err
-                ),
+        && matches!(load_state, SystemdUnitLoadState::loaded);
+
+    // Service.Type and Unit.StateChangeTimestamp live on different D-Bus
+    // interfaces, so they can't be merged into a single Properties.GetAll
+    // call - but the two round trips are independent and can be issued
+    // concurrently instead of one after the other.
+    let (oneshot_result, time_in_state_result) = tokio::join!(
+        async {
+            if needs_oneshot_check {
+                match connection {
+                    Some(conn) => Some(is_oneshot_service_unit(conn, unit).await),
+                    None => None,
+                }
+            } else {
+                None
             }
+        },
+        async {
+            if config.state_stats_time_in_state {
+                Some(get_time_in_state(connection, unit).await)
+            } else {
+                None
+            }
+        },
+    );
+
+    let mut is_oneshot_service = false;
+    if let Some(result) = oneshot_result {
+        match result {
+            Ok(is_oneshot) => is_oneshot_service = is_oneshot,
+            Err(err) => warn!(
+                "Unable to get Service.Type for {} (assuming not oneshot): {:?}",
+                &unit.name, err
+            ),
         }
     }
 
     // Get the state_change_timestamp to determine time in usecs we've been in current state
     let mut time_in_state_usecs: Option<u64> = None;
     let mut did_dbus_fetch = false;
-    if config.state_stats_time_in_state {
-        time_in_state_usecs = get_time_in_state(connection, unit).await?;
+    if let Some(result) = time_in_state_result {
+        time_in_state_usecs = result?;
         // get_time_in_state only issues a D-Bus call when connection is Some;
         // the None path logs an error and returns Ok(None) without calling out.
         did_dbus_fetch = connection.is_some();
